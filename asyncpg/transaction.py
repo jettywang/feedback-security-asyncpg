@@ -109,9 +109,14 @@ class Transaction(connresource.ConnectionResource):
                     'a manually started transaction')
             con._top_xact = self
         else:
-            # Nested transaction block
+            # Nested transaction block.  A savepoint inherits the
+            # characteristics of the outer transaction, so any mode
+            # requested here must already be in effect for the outer
+            # transaction; otherwise the request cannot be honored and
+            # must be rejected before the savepoint is created.
+            top_xact = con._top_xact
             if self._isolation:
-                top_xact_isolation = con._top_xact._isolation
+                top_xact_isolation = top_xact._isolation
                 if top_xact_isolation is None:
                     top_xact_isolation = ISOLATION_LEVELS_BY_VALUE[
                         await self._connection.fetchval(
@@ -121,6 +126,20 @@ class Transaction(connresource.ConnectionResource):
                         'nested transaction has a different isolation level: '
                         'current {!r} != outer {!r}'.format(
                             self._isolation, top_xact_isolation))
+            if self._readonly and not top_xact._readonly:
+                top_xact_readonly = await self._connection.fetchval(
+                    'SHOW transaction_read_only;')
+                if top_xact_readonly != 'on':
+                    raise apg_errors.InterfaceError(
+                        'nested transaction cannot be readonly: '
+                        'the outer transaction is not read-only')
+            if self._deferrable and not top_xact._deferrable:
+                top_xact_deferrable = await self._connection.fetchval(
+                    'SHOW transaction_deferrable;')
+                if top_xact_deferrable != 'on':
+                    raise apg_errors.InterfaceError(
+                        'nested transaction cannot be deferrable: '
+                        'the outer transaction is not deferrable')
             self._nested = True
 
         if self._nested:

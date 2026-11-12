@@ -301,6 +301,19 @@ class Connection(metaclass=ConnectionMeta):
         :param deferrable: Specifies whether or not this transaction is
                            deferrable.
 
+        .. note::
+
+           If a transaction is nested (i.e. started while another
+           transaction is already in progress on this connection), a
+           savepoint is created instead of a new transaction.  Savepoints
+           inherit the characteristics of the outer transaction, so a
+           nested transaction may only request modes that are already in
+           effect for the outer transaction: *isolation* must be equal to
+           the outer transaction's isolation level, and *readonly* and
+           *deferrable* cannot be enabled unless the outer transaction
+           has them enabled.  Otherwise :exc:`~asyncpg.InterfaceError`
+           is raised before the savepoint is created.
+
         .. _`PostgreSQL documentation`:
                 https://www.postgresql.org/docs/
                 current/static/sql-set-transaction.html

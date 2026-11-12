@@ -111,6 +111,16 @@ a `savepoint`_.):
        # will be nothing in `mytab`.
        assert await connection.fetch('SELECT a FROM mytab') == []
 
+A savepoint inherits the characteristics of the outer transaction, so a
+nested transaction may only request modes that are already in effect for
+the outer transaction: ``isolation`` must be equal to the outer
+transaction's isolation level, and ``readonly`` and ``deferrable`` cannot
+be enabled unless the outer transaction has them enabled.  Otherwise
+``asyncpg.InterfaceError`` is raised before the savepoint is created.
+Note that a transaction started manually with ``BEGIN`` cannot be
+combined with ``Connection.transaction()`` at all -- attempting to do so
+raises ``asyncpg.InterfaceError``.
+
 Alternatively, transactions can be used without an ``async with`` block:
 
 .. code-block:: python
