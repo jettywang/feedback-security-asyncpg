@@ -27,5 +27,6 @@ Contents
 
    installation
    usage
+   role_and_search_path_cache
    api/index
    faq
