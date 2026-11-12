@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import functools
 import gc
+import inspect
 import ipaddress
 import itertools
 import os
@@ -21,6 +22,7 @@ import stat
 import struct
 import tempfile
 import textwrap
+import types
 import unittest
 import unittest.mock
 import urllib.parse
@@ -1756,6 +1758,432 @@ class TestConnectionCleanup(tb.TestCase):
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+
+
+class TestHostFailoverRegression(tb.TestCase):
+    """Failover across the hosts of a single DSN.
+
+    These regressions pin the host-selection contract when several
+    addresses share one DSN: every candidate must be attempted with its
+    own address (and therefore its own TLS server name / socket path),
+    a rejected or failed candidate must be released, and the role check
+    (``target_session_attrs``) must drive the move to the next address.
+    """
+
+    HOSTS = ['primary-bad-cert.example', 'standby.example',
+             'primary.example']
+    PORTS = [5432, 5433, 5434]
+
+    def _verify_full_context(self):
+        # A verify-full context backed by the bundled test CA: hostname
+        # checking stays enabled, so the per-address server name matters.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(SSL_CA_CERT_FILE)
+        self.assertTrue(context.check_hostname)
+        return context
+
+    def _fake_connect_addr(self, outcomes, calls):
+        """Build a ``_connect_addr`` stand-in keyed by candidate address.
+
+        Each stand-in records the exact arguments the dispatcher passed for
+        that candidate.  A certificate problem is raised as an OSError
+        (``ssl.SSLError`` subclasses OSError), matching how a real TLS
+        handshake failure surfaces through ``__connect_addr``.
+        """
+
+        async def fake_connect_addr(*, addr, loop, params, config,
+                                    connection_class, record_class):
+            calls.append({
+                'addr': addr,
+                'user': params.user,
+                'password': params.password,
+                'database': params.database,
+                'sslmode': params.sslmode,
+                'ssl': params.ssl,
+                'target_session_attrs': params.target_session_attrs,
+            })
+            outcome = outcomes[addr]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return fake_connect_addr
+
+    @staticmethod
+    def _candidate(addr, *, read_only):
+        """A connection stand-in carrying the role it would report."""
+
+        con = unittest.mock.Mock(spec=pg_connection.Connection)
+        con._addr = addr
+        con.get_settings.return_value = types.SimpleNamespace(
+            in_hot_standby='on' if read_only else 'off',
+            default_transaction_read_only='on' if read_only else 'off')
+        return con
+
+    async def test_failover_past_cert_error_and_readonly_to_rw(self):
+        cert_error = ssl.SSLCertVerificationError(
+            '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed')
+        standby = self._candidate(('standby.example', 5433), read_only=True)
+        primary = self._candidate(('primary.example', 5434), read_only=False)
+        outcomes = {
+            ('primary-bad-cert.example', 5432): cert_error,
+            ('standby.example', 5433): standby,
+            ('primary.example', 5434): primary,
+        }
+        calls = []
+        closed = []
+        standby.terminate.side_effect = lambda: closed.append(
+            ('standby.example', 5433))
+        verify_full = self._verify_full_context()
+
+        with unittest.mock.patch.object(
+            connect_utils, '_connect_addr',
+            self._fake_connect_addr(outcomes, calls),
+        ):
+            con = await asyncpg.connect(
+                dsn='postgresql://app:secret@'
+                    'primary-bad-cert.example:5432,'
+                    'standby.example:5433,'
+                    'primary.example:5434/appdb'
+                    '?target_session_attrs=read-write',
+                ssl=verify_full,
+            )
+
+        self.assertIs(con, primary)
+        # Every candidate is attempted in declaration order, each with its
+        # own address rather than reusing the first host's name.
+        self.assertEqual(
+            [call['addr'] for call in calls],
+            [('primary-bad-cert.example', 5432),
+             ('standby.example', 5433),
+             ('primary.example', 5434)],
+        )
+        # The same credentials / DSN parameters travel with every attempt;
+        # a failed handshake on one host must not mutate them for the rest.
+        for call in calls:
+            self.assertEqual(call['user'], 'app')
+            self.assertEqual(call['password'], 'secret')
+            self.assertEqual(call['database'], 'appdb')
+            self.assertEqual(call['sslmode'], SSLMode.require)
+            self.assertEqual(
+                call['target_session_attrs'],
+                connect_utils.SessionAttribute.read_write,
+            )
+            self.assertIs(call['ssl'], verify_full)
+            self.assertTrue(call['ssl'].check_hostname)
+        # The connectable-but-read-only candidate is released, the chosen
+        # read-write candidate is handed back untouched.
+        standby.terminate.assert_called_once_with()
+        standby.close.assert_not_called()
+        primary.terminate.assert_not_called()
+        primary.close.assert_not_called()
+        self.assertEqual(closed, [('standby.example', 5433)])
+
+    async def test_each_candidate_uses_own_certificate_name(self):
+        # The TLS server name is selected per address: a handshake rejected
+        # for the first host's name still lets the next host verify against
+        # its own name.  The first candidate runs the real STARTTLS code
+        # path against loop stubs; later candidates use a _connect_addr
+        # stand-in so no PostgreSQL wire protocol has to be simulated.
+        hostnames = []
+        standby = self._candidate(('standby.example', 5433), read_only=True)
+        primary = self._candidate(('primary.example', 5434), read_only=False)
+        verify_full = self._verify_full_context()
+
+        class FakeTransport:
+            def __init__(self):
+                self.closed = False
+
+            def write(self, data):
+                # The connector writes an SSLRequest then waits for the
+                # server's single-byte verdict; answer that it may upgrade.
+                if data[4:] == struct.pack('!I',
+                                           connect_utils._SSL_REQUEST_CODE):
+                    self.loop.call_soon(self.proto.data_received, b'S')
+
+            def close(self):
+                self.closed = True
+
+            def get_extra_info(self, name, default=None):
+                return default
+
+            def set_protocol(self, protocol):
+                self.proto = protocol
+
+        async def fake_create_connection(protocol_factory, host, port):
+            transport = FakeTransport()
+            transport.loop = self.loop
+            protocol = protocol_factory()
+            transport.proto = protocol
+            return transport, protocol
+
+        async def fake_start_tls(transport, protocol, ssl_context, *,
+                                 server_hostname):
+            hostnames.append(server_hostname)
+            transport.close()
+            raise ssl.SSLCertVerificationError(
+                f'hostname mismatch for {server_hostname!r}')
+
+        real_connect_addr = connect_utils._connect_addr
+
+        async def selective_connect_addr(*, addr, loop, params, config,
+                                         connection_class, record_class):
+            self.assertIs(params.ssl, verify_full)
+            # The first candidate runs the real connector (and therefore the
+            # real STARTTLS handshake); only surviving hosts are faked.
+            if addr == ('primary-bad-cert.example', 5432):
+                return await real_connect_addr(
+                    addr=addr, loop=loop, params=params, config=config,
+                    connection_class=connection_class,
+                    record_class=record_class)
+            if addr == ('standby.example', 5433):
+                return standby
+            if addr == ('primary.example', 5434):
+                return primary
+            raise AssertionError(f'unexpected address {addr!r}')
+
+        with unittest.mock.patch.object(
+            self.loop, 'create_connection', fake_create_connection,
+        ), unittest.mock.patch.object(
+            self.loop, 'start_tls', fake_start_tls,
+        ), unittest.mock.patch.object(
+            connect_utils, '_connect_addr', selective_connect_addr,
+        ):
+            con = await asyncpg.connect(
+                host=self.HOSTS, port=self.PORTS, user='app',
+                password='secret', database='appdb',
+                ssl=verify_full,
+                target_session_attrs='read-write',
+            )
+
+        self.assertIs(con, primary)
+        # The handshake was attempted against the first host's own name
+        # only, and that failed transport was closed during unwinding.
+        self.assertEqual(hostnames, ['primary-bad-cert.example'])
+        standby.terminate.assert_called_once_with()
+        standby.close.assert_not_called()
+        primary.terminate.assert_not_called()
+        primary.close.assert_not_called()
+
+    async def test_password_callable_is_resolved_for_every_candidate(self):
+        # Password callables are resolved inside _connect_addr, once per
+        # attempt, so a failure on one host cannot hand a stale secret to
+        # the next.  Mirror the real resolution step in a wrapper around a
+        # recording stand-in rather than resolving once up front.
+        resolved = []
+
+        def password():
+            secret = f'secret-{len(resolved)}'
+            resolved.append(secret)
+            return secret
+
+        cert_error = ssl.SSLError('bad cipher')
+        primary = self._candidate(('primary.example', 5434), read_only=False)
+        outcomes = {
+            ('primary-bad-cert.example', 5432): cert_error,
+            ('primary.example', 5434): primary,
+        }
+        calls = []
+        recording = self._fake_connect_addr(outcomes, calls)
+
+        async def resolving_connect_addr(**kwargs):
+            params = kwargs['params']
+            if callable(params.password):
+                secret = params.password()
+                if inspect.isawaitable(secret):
+                    secret = await secret
+                kwargs['params'] = params._replace(password=secret)
+            return await recording(**kwargs)
+
+        with unittest.mock.patch.object(
+            connect_utils, '_connect_addr', resolving_connect_addr,
+        ):
+            con = await asyncpg.connect(
+                host=['primary-bad-cert.example', 'primary.example'],
+                port=[5432, 5434], user='app', password=password,
+                database='appdb', ssl=self._verify_full_context(),
+                target_session_attrs='read-write',
+            )
+
+        self.assertIs(con, primary)
+        self.assertEqual(len(calls), 2)
+        # The stand-in receives a freshly resolved password per attempt,
+        # proving resolution happens for every candidate rather than once.
+        self.assertEqual(
+            [call['password'] for call in calls], ['secret-0', 'secret-1'])
+        self.assertEqual(resolved, ['secret-0', 'secret-1'])
+        primary.terminate.assert_not_called()
+
+    async def test_unix_socket_candidates_skip_tls_contract(self):
+        socket_a = '/tmp/.s.PGSQL.5432'
+        socket_b = '/tmp/.s.PGSQL.5433'
+        standby = self._candidate(socket_a, read_only=True)
+        primary = self._candidate(socket_b, read_only=False)
+        outcomes = {socket_a: standby, socket_b: primary}
+        calls = []
+
+        with unittest.mock.patch.object(
+            connect_utils, '_connect_addr',
+            self._fake_connect_addr(outcomes, calls),
+        ):
+            con = await asyncpg.connect(
+                host=[socket_a, socket_b], user='app', password='secret',
+                database='appdb', ssl=self._verify_full_context(),
+                target_session_attrs='read-write',
+            )
+
+        self.assertIs(con, primary)
+        self.assertEqual([call['addr'] for call in calls],
+                         [socket_a, socket_b])
+        for call in calls:
+            # UNIX sockets carry no network name, so the verify-full
+            # hostname contract has nothing to attach to.
+            self.assertIsInstance(call['addr'], str)
+        standby.terminate.assert_called_once_with()
+        primary.terminate.assert_not_called()
+
+    async def test_explicit_ssl_context_is_passed_to_every_candidate(self):
+        custom_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        custom_context.check_hostname = False
+        custom_context.verify_mode = ssl.CERT_NONE
+
+        cert_error = ssl.SSLError('handshake reset')
+        standby = self._candidate(('standby.example', 5433), read_only=True)
+        primary = self._candidate(('primary.example', 5434), read_only=False)
+        outcomes = {
+            ('primary-bad-cert.example', 5432): cert_error,
+            ('standby.example', 5433): standby,
+            ('primary.example', 5434): primary,
+        }
+        calls = []
+
+        with unittest.mock.patch.object(
+            connect_utils, '_connect_addr',
+            self._fake_connect_addr(outcomes, calls),
+        ):
+            con = await asyncpg.connect(
+                host=self.HOSTS, port=self.PORTS, user='app',
+                password='secret', database='appdb', ssl=custom_context,
+                target_session_attrs='read-write',
+            )
+
+        self.assertIs(con, primary)
+        self.assertEqual(len(calls), 3)
+        for call in calls:
+            # An explicit context is forwarded verbatim and implies
+            # sslmode=require; asyncpg must not wrap or replace it.
+            self.assertIs(call['ssl'], custom_context)
+            self.assertEqual(call['sslmode'], SSLMode.require)
+        standby.terminate.assert_called_once_with()
+        primary.terminate.assert_not_called()
+
+    async def test_direct_tls_uses_each_hostname_for_handshake(self):
+        # Direct TLS never uses the STARTTLS helper: each address reaches
+        # loop.create_connection with ssl=<context> and its own server
+        # hostname.  Keep the real _connect_addr and stub only the direct
+        # handshake plus the (blocked) PostgreSQL authentication.
+        hostnames = []
+        cert_error = ssl.SSLCertVerificationError('bad hostname')
+        primary = self._candidate(('primary.example', 5434), read_only=False)
+        verify_full = self._verify_full_context()
+        real_connect_addr = connect_utils._connect_addr
+
+        async def fake_create_connection(protocol_factory, host, port, *,
+                                         ssl=None, server_hostname=None,
+                                         **kwargs):
+            # asyncio infers the TLS server name from the positional host
+            # when server_hostname is not passed explicitly.
+            effective_name = server_hostname or host
+            hostnames.append(effective_name)
+            self.assertIs(ssl, verify_full)
+            self.assertEqual(effective_name, host)
+            if host == 'primary-bad-cert.example':
+                raise cert_error
+            raise AssertionError(
+                'the second host must not reach create_connection once '
+                '_connect_addr is short-circuited')
+
+        async def selective_connect_addr(*, addr, loop, params, config,
+                                         connection_class, record_class):
+            # The first host must run through the real connector so its
+            # direct-TLS create_connection call is exercised; only the
+            # surviving second host gets a stand-in.
+            if addr == ('primary-bad-cert.example', 5432):
+                return await real_connect_addr(
+                    addr=addr, loop=loop, params=params, config=config,
+                    connection_class=connection_class,
+                    record_class=record_class)
+            self.assertEqual(addr, ('primary.example', 5434))
+            return primary
+
+        with unittest.mock.patch.object(
+            self.loop, 'create_connection', fake_create_connection,
+        ), unittest.mock.patch.object(
+            connect_utils, '_connect_addr', selective_connect_addr,
+        ):
+            con = await asyncpg.connect(
+                host=['primary-bad-cert.example', 'primary.example'],
+                port=[5432, 5434], user='app', password='secret',
+                database='appdb', ssl=verify_full, direct_tls=True,
+                target_session_attrs='read-write',
+            )
+
+        self.assertIs(con, primary)
+        # The failed handshake used the first host's own name and, being an
+        # OSError, let the dispatcher move on to the second candidate.
+        self.assertEqual(hostnames, ['primary-bad-cert.example'])
+        primary.terminate.assert_not_called()
+
+    async def test_all_candidates_rejected_raises_and_closes(self):
+        cert_error = ssl.SSLError('tls failure')
+        standby = self._candidate(('standby.example', 5433), read_only=True)
+
+        # Path 1: a transport-level failure on one host plus a role mismatch
+        # on the other surfaces the last transport error while still
+        # releasing the connectable candidate.
+        outcomes = {
+            ('primary-bad-cert.example', 5432): cert_error,
+            ('standby.example', 5433): standby,
+        }
+        calls = []
+        with unittest.mock.patch.object(
+            connect_utils, '_connect_addr',
+            self._fake_connect_addr(outcomes, calls),
+        ):
+            with self.assertRaises(ssl.SSLError):
+                await asyncpg.connect(
+                    host=['primary-bad-cert.example', 'standby.example'],
+                    port=[5432, 5433], user='app', password='secret',
+                    database='appdb', ssl=self._verify_full_context(),
+                    target_session_attrs='read-write',
+                )
+        self.assertEqual(len(calls), 2)
+        standby.terminate.assert_called_once_with()
+        standby.close.assert_not_called()
+
+        # Path 2: every host connects but none matches the read-write role;
+        # with no transport error on record, the dedicated attribute error
+        # is raised and every opened candidate is terminated.
+        only_standby = self._candidate(
+            ('standby.example', 5433), read_only=True)
+        outcomes = {('standby.example', 5433): only_standby}
+        calls = []
+        with unittest.mock.patch.object(
+            connect_utils, '_connect_addr',
+            self._fake_connect_addr(outcomes, calls),
+        ):
+            with self.assertRaises(
+                exceptions.TargetServerAttributeNotMatched,
+            ):
+                await asyncpg.connect(
+                    host=['standby.example'], port=[5433],
+                    user='app', password='secret', database='appdb',
+                    ssl=self._verify_full_context(),
+                    target_session_attrs='read-write',
+                )
+        self.assertEqual(len(calls), 1)
+        only_standby.terminate.assert_called_once_with()
+        only_standby.close.assert_not_called()
 
 
 class TestConnection(tb.ConnectedTestCase):
