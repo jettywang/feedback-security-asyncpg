@@ -6,6 +6,12 @@
 
 
 import re
+from typing import Any
+
+
+def record_to_dict(record: Any, *, strict: bool = False) -> dict[str, Any]:
+    """Convert an asyncpg Record into a regular dict."""
+    return record.as_dict(strict=strict)
 
 
 def _quote_ident(ident):

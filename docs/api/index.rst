@@ -332,6 +332,26 @@ items either by a numeric index or by a field name:
 
       Return an iterator over ``(field, value)`` pairs.
 
+   .. method:: as_dict(*, strict=False)
+
+      Return a regular ``dict`` of ``(field, value)`` pairs.  With
+      *strict* set to ``False`` (the default), duplicate field names keep
+      the last value, matching ``dict(record)``.
+
+      With *strict* set to ``True``, a ``ValueError`` is raised if two or
+      more fields share a name.  The exception message contains only the
+      duplicated field name and its zero-based position; the exception also
+      exposes them as ``column_name`` and ``position``, with
+      ``first_position`` identifying the earlier field.  This check runs
+      in the ``Record``-to-dict mapping layer, after the query, prepared
+      statement, or cursor has already returned the record; record
+      creation, positional indexing, and field-name lookup are unchanged.
+
+      :func:`asyncpg.record_to_dict` is a function-level entry point with
+      the same *strict* argument.
+
+      .. versionadded:: 0.33.0
+
 
 .. class:: ConnectionSettings()
 

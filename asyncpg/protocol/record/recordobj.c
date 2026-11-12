@@ -710,6 +710,169 @@ record_get(PyObject *self, PyTypeObject *defcls, PyObject *const *args,
     return val;
 }
 
+PyDoc_STRVAR(record_as_dict_doc,
+"as_dict(*, strict=False)\n"
+"\n"
+"Return the record as a dictionary.\n"
+"\n"
+"If *strict* is true, raise ValueError when more than one field has\n"
+"the same name.  The error identifies the duplicated field name and\n"
+"its position in the record.  With *strict* false (the default), a\n"
+"duplicate name is resolved like dict(record): the last value wins.");
+
+static Py_ssize_t
+record_find_first_key(PyObject *keys, Py_ssize_t upto, PyObject *key)
+{
+    Py_ssize_t i;
+
+    for (i = 0; i < upto; i++) {
+        int eq = PyObject_RichCompareBool(
+            PyTuple_GET_ITEM(keys, i), key, Py_EQ);
+        if (eq < 0) {
+            return -1;
+        }
+        if (eq) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static PyObject *
+record_as_dict(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+    ApgRecordObject *r = (ApgRecordObject *)self;
+    PyObject *dict;
+    PyObject *keys;
+    PyObject *strict_obj = Py_False;
+    Py_ssize_t i, nkeys, nelems;
+    int strict;
+    static char *kwlist[] = {"strict", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(
+            args, kwargs, "|O:as_dict", kwlist, &strict_obj)) {
+        return NULL;
+    }
+    if (PyTuple_GET_SIZE(args) != 0) {
+        PyErr_SetString(
+            PyExc_TypeError,
+            "as_dict() takes no positional arguments");
+        return NULL;
+    }
+    if (!PyBool_Check(strict_obj)) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "as_dict() strict must be bool, got %.100s",
+            Py_TYPE(strict_obj)->tp_name);
+        return NULL;
+    }
+    strict = (strict_obj == Py_True);
+
+    dict = PyDict_New();
+    if (dict == NULL) {
+        return NULL;
+    }
+
+    if (r->desc == NULL || r->desc->keys == NULL) {
+        return dict;
+    }
+
+    keys = r->desc->keys;
+    nkeys = PyTuple_GET_SIZE(keys);
+    nelems = Py_SIZE(r);
+
+    for (i = 0; i < nkeys && i < nelems; i++) {
+        PyObject *key = PyTuple_GET_ITEM(keys, i);
+        PyObject *value = record_item(r, i);
+        int contains;
+
+        if (value == NULL) {
+            goto error;
+        }
+
+        if (strict) {
+            contains = PyDict_Contains(dict, key);
+            if (contains < 0) {
+                Py_DECREF(value);
+                goto error;
+            }
+            if (contains) {
+                PyObject *exc;
+                PyObject *msg;
+                PyObject *pos;
+                Py_ssize_t first = record_find_first_key(keys, i, key);
+
+                if (first < 0 && PyErr_Occurred()) {
+                    Py_DECREF(value);
+                    goto error;
+                }
+
+                if (first >= 0) {
+                    msg = PyUnicode_FromFormat(
+                        "duplicate column name %R at position %zd "
+                        "(first occurrence at position %zd)",
+                        key, i, first);
+                }
+                else {
+                    msg = PyUnicode_FromFormat(
+                        "duplicate column name %R at position %zd",
+                        key, i);
+                }
+                Py_DECREF(value);
+                if (msg == NULL) {
+                    goto error;
+                }
+                exc = PyObject_CallFunctionObjArgs(
+                    PyExc_ValueError, msg, NULL);
+                Py_DECREF(msg);
+                if (exc == NULL) {
+                    goto error;
+                }
+                if (PyObject_SetAttrString(exc, "column_name", key) < 0) {
+                    PyErr_Clear();
+                }
+                pos = PyLong_FromSsize_t(i);
+                if (pos != NULL) {
+                    if (PyObject_SetAttrString(exc, "position", pos) < 0) {
+                        PyErr_Clear();
+                    }
+                    Py_DECREF(pos);
+                }
+                else {
+                    PyErr_Clear();
+                }
+                pos = PyLong_FromSsize_t(first);
+                if (first >= 0 && pos != NULL) {
+                    if (PyObject_SetAttrString(
+                            exc, "first_position", pos) < 0) {
+                        PyErr_Clear();
+                    }
+                    Py_DECREF(pos);
+                }
+                else {
+                    Py_XDECREF(pos);
+                    PyErr_Clear();
+                }
+                PyErr_SetObject(PyExc_ValueError, exc);
+                Py_DECREF(exc);
+                goto error;
+            }
+        }
+
+        if (PyDict_SetItem(dict, key, value) < 0) {
+            Py_DECREF(value);
+            goto error;
+        }
+        Py_DECREF(value);
+    }
+
+    return dict;
+
+error:
+    Py_DECREF(dict);
+    return NULL;
+}
+
 static PyObject *
 record_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
 {
@@ -734,6 +897,10 @@ static PyMethodDef record_methods[] = {
     {"keys", _PyCFunction_CAST(record_keys), METH_METHOD | METH_FASTCALL | METH_KEYWORDS},
     {"items", _PyCFunction_CAST(record_items), METH_METHOD | METH_FASTCALL | METH_KEYWORDS},
     {"get", _PyCFunction_CAST(record_get), METH_METHOD | METH_FASTCALL | METH_KEYWORDS},
+    {"as_dict", (PyCFunction)record_as_dict, METH_VARARGS | METH_KEYWORDS,
+     record_as_dict_doc},
+    {"to_dict", (PyCFunction)record_as_dict, METH_VARARGS | METH_KEYWORDS,
+     record_as_dict_doc},
     {NULL, NULL} /* sentinel */
 };
 

@@ -298,6 +298,69 @@ class TestRecord(tb.ConnectedTestCase):
             with self.assertRaises(TypeError):
                 r.get(default=2)
 
+    def test_record_as_dict_empty(self):
+        r = Record(None, ())
+        self.assertEqual(r.as_dict(), {})
+        self.assertEqual(r.as_dict(strict=True), {})
+
+    def test_record_as_dict_unique(self):
+        r = Record(R_AB, (42, 43))
+        expected = {'a': 42, 'b': 43}
+        self.assertEqual(r.as_dict(), expected)
+        self.assertEqual(r.as_dict(strict=False), expected)
+        self.assertEqual(r.as_dict(strict=True), expected)
+        self.assertEqual(r.to_dict(strict=True), expected)
+
+    def test_record_as_dict_duplicate_strict(self):
+        class DuplicateMapping:
+            def keys(self):
+                return ('owner', 'id', 'owner')
+
+            def __iter__(self):
+                return iter(self.keys())
+
+            def __len__(self):
+                return 3
+
+            def __getitem__(self, key):
+                return {'owner': 2, 'id': 1}[key]
+
+        r = Record(DuplicateMapping(), ('alice', 7, 'bob'))
+        self.assertEqual(len(r), 3)
+        self.assertEqual(r[0], 'alice')
+        self.assertEqual(r[2], 'bob')
+        self.assertEqual(r['owner'], 'bob')
+        self.assertEqual(r.as_dict(), {'owner': 'bob', 'id': 7})
+        self.assertEqual(
+            asyncpg.record_to_dict(r),
+            {'owner': 'bob', 'id': 7}
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"duplicate column name 'owner' at position 2 "
+            r"\(first occurrence at position 0\)"
+        ) as cm:
+            r.as_dict(strict=True)
+
+        self.assertEqual(cm.exception.column_name, 'owner')
+        self.assertEqual(cm.exception.position, 2)
+        self.assertEqual(cm.exception.first_position, 0)
+
+        with self.assertRaises(ValueError):
+            asyncpg.record_to_dict(r, strict=True)
+
+    def test_record_as_dict_invalid_strict(self):
+        r = Record(R_A, (42,))
+        with self.assertRaises(TypeError):
+            r.as_dict(strict='yes')
+        with self.assertRaises(TypeError):
+            r.as_dict(strict=object())
+        with self.assertRaises(TypeError):
+            r.as_dict(False)
+        with self.assertRaises(TypeError):
+            r.as_dict(False, strict=True)
+
     def test_record_not_pickleable(self):
         r = Record(R_A, (42,))
         with self.assertRaises(Exception):
@@ -347,6 +410,57 @@ class TestRecord(tb.ConnectedTestCase):
                 self.assertEqual(list(r.items()), desc)
                 self.assertEqual(list(r.values()), [p[1] for p in desc])
                 self.assertEqual(list(r.keys()), [p[0] for p in desc])
+
+    async def test_record_as_dict_strict_query_paths(self):
+        duplicate_query = (
+            "SELECT 1 AS owner, 2 AS reviewer, 3 AS owner"
+        )
+        unique_query = "SELECT 1 AS owner, 2 AS reviewer"
+
+        async def check_record(record):
+            self.assertEqual(
+                record.as_dict(),
+                {'owner': 3, 'reviewer': 2}
+            )
+            self.assertEqual(record[0], 1)
+            self.assertEqual(record[2], 3)
+            self.assertEqual(record['owner'], 3)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"duplicate column name 'owner' at position 2 "
+                r"\(first occurrence at position 0\)"
+            ) as cm:
+                record.as_dict(strict=True)
+            self.assertEqual(cm.exception.column_name, 'owner')
+            self.assertEqual(cm.exception.position, 2)
+            self.assertEqual(cm.exception.first_position, 0)
+
+        record = await self.con.fetchrow(duplicate_query)
+        await check_record(record)
+
+        statement = await self.con.prepare(duplicate_query)
+        record = await statement.fetchrow()
+        await check_record(record)
+
+        async with self.con.transaction():
+            cursor = await self.con.cursor(duplicate_query)
+            record = await cursor.fetchrow()
+            await check_record(record)
+
+            cursor = await self.con.cursor(duplicate_query)
+            records = await cursor.fetch(1)
+            await check_record(records[0])
+
+        record = await self.con.fetchrow(unique_query)
+        self.assertEqual(
+            record.as_dict(strict=True),
+            {'owner': 1, 'reviewer': 2}
+        )
+
+        empty_record = await self.con.fetchrow('SELECT')
+        self.assertEqual(len(empty_record), 0)
+        self.assertEqual(empty_record.as_dict(strict=True), {})
 
     async def test_record_isinstance(self):
         """Test that Record works with isinstance."""
