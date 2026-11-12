@@ -10,6 +10,7 @@ import asyncpg
 import collections
 import collections.abc
 import contextlib
+import contextvars
 import functools
 import itertools
 import inspect
@@ -33,6 +34,23 @@ from . import transaction
 from . import utils
 
 
+class _CancelTarget(typing.NamedTuple):
+    # An immutable snapshot of where and how a CancelRequest must be
+    # delivered.  It is captured when the cancellation is requested so
+    # that a stale cancel key can never be sent to a different backend
+    # (e.g. a standby that took over the address after a failover).
+    protocol: object
+    addr: object
+    params: connect_utils._ConnectionParameters
+    backend_pid: int
+    backend_secret: int
+
+
+_CANCEL_TARGET_MISSING = object()
+_cancel_target_var = contextvars.ContextVar(
+    'asyncpg_cancel_target', default=_CANCEL_TARGET_MISSING)
+
+
 class ConnectionMeta(type):
 
     def __instancecheck__(cls, instance):
@@ -53,6 +71,7 @@ class Connection(metaclass=ConnectionMeta):
                  '_listeners', '_server_version', '_server_caps',
                  '_intro_query', '_reset_query', '_proxy',
                  '_stmt_exclusive_section', '_config', '_params', '_addr',
+                 '_cancel_params',
                  '_log_listeners', '_termination_listeners', '_cancellations',
                  '_pool_holder',
                  '_source_traceback', '_query_loggers', '__weakref__')
@@ -74,6 +93,11 @@ class Connection(metaclass=ConnectionMeta):
         self._addr = addr
         self._config = config
         self._params = params
+        # The parameters of the actual negotiated transport.  This may
+        # differ from `params` (e.g. an sslmode=prefer fallback to
+        # plaintext); connect_utils sets the exact value after a
+        # successful connect.
+        self._cancel_params = params
 
         self._stmt_cache = _StatementCache(
             loop=loop,
@@ -1675,24 +1699,63 @@ class Connection(metaclass=ConnectionMeta):
             # so we ignore the timeout.
             await self._protocol.close_statement(stmt, protocol.NO_TIMEOUT)
 
+    def _snapshot_cancel_target(self):
+        protocol = self._protocol
+        if (
+            protocol is None
+            or self._aborted
+            or self._transport is None
+            or self._transport.is_closing()
+        ):
+            # The connection is already gone.  Its cancel key must not
+            # be sent anywhere: the address may now belong to a different
+            # backend (e.g. a promoted standby).
+            return None
+        return _CancelTarget(
+            protocol=protocol,
+            addr=self._addr,
+            params=self._cancel_params,
+            backend_pid=protocol.backend_pid,
+            backend_secret=protocol.backend_secret,
+        )
+
+    def _cancel_target_is_current(self, target):
+        return (
+            target is not None
+            # A new connection must never inherit the old cancel key.
+            and self._protocol is target.protocol
+            and not self._aborted
+            and self._transport is not None
+            and not self._transport.is_closing()
+        )
+
     async def _cancel(self, waiter, cancel_waiter=None):
+        target = _cancel_target_var.get()
+        if target is _CANCEL_TARGET_MISSING:
+            target = self._snapshot_cancel_target()
         try:
             async with compat.timeout(self._config.command_timeout):
-                try:
-                    await connect_utils._cancel(
-                        loop=self._loop, addr=self._addr, params=self._params,
-                        backend_pid=self._protocol.backend_pid,
-                        backend_secret=self._protocol.backend_secret)
-                except ConnectionResetError:
-                    # Some servers reset the auxiliary connection after
-                    # receiving the CancelRequest.  The original connection
-                    # still has to acknowledge the cancelled query.
-                    pass
+                if self._cancel_target_is_current(target):
+                    try:
+                        await connect_utils._cancel(
+                            loop=self._loop, addr=target.addr,
+                            params=target.params,
+                            backend_pid=target.backend_pid,
+                            backend_secret=target.backend_secret)
+                    except ConnectionResetError:
+                        # Some servers reset the auxiliary connection after
+                        # receiving the CancelRequest.  The original connection
+                        # still has to acknowledge the cancelled query.
+                        pass
 
-                if not waiter.done():
-                    waiter.set_result(None)
-                if cancel_waiter is not None:
-                    await asyncio.shield(cancel_waiter)
+                    if not waiter.done():
+                        waiter.set_result(None)
+                    if cancel_waiter is not None:
+                        await asyncio.shield(cancel_waiter)
+                # If the target is no longer current, the connection was
+                # lost or replaced before the cancel task ran; do not send
+                # a stale cancel key.  The protocol has already completed
+                # its cancel waiters when the connection was dropped.
         except asyncio.CancelledError:
             # Teardown can cancel this background task.  Its waiters are
             # completed in finally, without leaking CancelledError.
@@ -1709,8 +1772,19 @@ class Connection(metaclass=ConnectionMeta):
                 waiter.set_result(None)
 
     def _cancel_current_command(self, waiter, cancel_waiter=None):
-        self._cancellations.add(self._loop.create_task(
-            self._cancel(waiter, cancel_waiter)))
+        # Snapshot the cancel target synchronously: the background task
+        # must not pick up a different backend's address or cancel key
+        # if this connection is replaced before the task runs.
+        target = self._snapshot_cancel_target()
+
+        async def run():
+            token = _cancel_target_var.set(target)
+            try:
+                return await self._cancel(waiter, cancel_waiter)
+            finally:
+                _cancel_target_var.reset(token)
+
+        self._cancellations.add(self._loop.create_task(run()))
 
     def _process_log_message(self, fields, last_query):
         if not self._log_listeners:

@@ -1194,6 +1194,11 @@ async def __connect_addr(
         raise
 
     con = connection_class(pr, tr, loop, addr, config, params_input)
+    # Record the exact parameters that produced this connection.  With
+    # sslmode=allow/prefer fallbacks or direct TLS, the input parameters
+    # may not describe the negotiated transport, and a later CancelRequest
+    # must mirror the transport that is actually in use.
+    con._cancel_params = params
     pr.set_connection(con)
     return con
 
@@ -1321,14 +1326,28 @@ async def _cancel(*, loop, addr, params: _ConnectionParameters,
 
         def connection_lost(self, exc):
             if not self.on_disconnect.done():
-                self.on_disconnect.set_result(True)
+                if exc is None:
+                    self.on_disconnect.set_result(True)
+                else:
+                    # A transport error on the cancel connection means the
+                    # CancelRequest cannot be considered delivered.  The
+                    # caller must not confuse this with a successful
+                    # cancellation of the original query.
+                    self.on_disconnect.set_exception(exc)
 
     tr = None
+    pr = None
     try:
         if isinstance(addr, str):
             tr, pr = await loop.create_unix_connection(CancelProto, addr)
         else:
-            if params.ssl and params.sslmode != SSLMode.allow:
+            if params.ssl and params.ssl_negotiation is SSLNegotiation.direct:
+                # The main connection was made with direct TLS: the server
+                # expects a TLS handshake immediately, without the
+                # PostgreSQL STARTTLS round-trip.
+                tr, pr = await loop.create_connection(
+                    CancelProto, *addr, ssl=params.ssl)
+            elif params.ssl:
                 tr, pr = await _create_ssl_connection(
                     CancelProto,
                     *addr,
@@ -1348,6 +1367,14 @@ async def _cancel(*, loop, addr, params: _ConnectionParameters,
     finally:
         if tr is not None:
             tr.close()
+        if pr is not None:
+            if not pr.on_disconnect.done():
+                pr.on_disconnect.cancel()
+            elif not pr.on_disconnect.cancelled():
+                # Retrieve a transport error that arrived after the
+                # CancelRequest was written so that it is not reported
+                # as an unhandled exception.
+                pr.on_disconnect.exception()
 
 
 def _get_socket(transport):
